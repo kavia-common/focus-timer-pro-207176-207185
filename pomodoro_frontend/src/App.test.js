@@ -42,29 +42,21 @@ function getTimeText() {
 
 /**
  * Configure Jest fake timers such that:
- * - `Date.now()` advances when we advance timers
- * - interval/timeout callbacks are flushed deterministically
+ * - timers/intervals can be advanced deterministically
+ * - `Date.now()` is synchronized with the fake timer clock
  *
- * CRA 5 uses Jest 27; "modern" fake timers support `advanceTimers` and `setSystemTime`.
+ * CRA 5 uses Jest 27; "modern" fake timers support `setSystemTime`.
  */
 function useDeterministicFakeTimers() {
   jest.useFakeTimers("modern");
+
+  /**
+   * IMPORTANT:
+   * - Our app uses Date.now() to compute remaining time against an "endAt" timestamp.
+   * - In Jest, advancing timers does not always guarantee React has committed state updates
+   *   from interval callbacks unless we flush microtasks as well.
+   */
   jest.setSystemTime(new Date("2020-01-02T12:00:00.000Z"));
-}
-
-/**
- * Advance both virtual time (setTimeout / setInterval) and system time (Date.now()).
- * This is required because App's tick() relies on Date.now/endAt calculations.
- */
-async function advanceTime(ms) {
-  act(() => {
-    jest.advanceTimersByTime(ms);
-  });
-
-  // Give React a chance to commit updates scheduled from timer callbacks.
-  await act(async () => {
-    await Promise.resolve();
-  });
 }
 
 /**
@@ -84,6 +76,41 @@ async function flushTimersAndMicrotasks(user) {
   // user-event uses promises/microtasks; allow them to flush too.
   if (user?.keyboard) {
     await Promise.resolve();
+  }
+}
+
+/**
+ * Advance time in deterministic "tick-sized" steps so setInterval(250) callbacks
+ * always have an opportunity to run and commit state.
+ *
+ * This prevents flakiness where we advance a large amount of time but the last interval
+ * callback that would call handlePhaseEnd() doesn't get a chance to run/commit before assertions.
+ */
+async function advanceTime(ms, { stepMs = 250 } = {}) {
+  const steps = Math.ceil(ms / stepMs);
+  for (let i = 0; i < steps; i += 1) {
+    const delta = i === steps - 1 ? ms - stepMs * (steps - 1) : stepMs;
+    act(() => {
+      jest.advanceTimersByTime(delta);
+    });
+    // Let React commit updates scheduled by this tick.
+    // eslint-disable-next-line no-await-in-loop
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+}
+
+/**
+ * Advance time until the UI reflects the Break/CHILL phase.
+ * We keep it bounded to avoid infinite loops.
+ */
+async function advanceUntilChill({ maxMs = 90_000, stepMs = 250 } = {}) {
+  const steps = Math.ceil(maxMs / stepMs);
+  for (let i = 0; i < steps; i += 1) {
+    if (screen.queryByRole("heading", { name: /^chill$/i })) return;
+    // eslint-disable-next-line no-await-in-loop
+    await advanceTime(stepMs, { stepMs });
   }
 }
 
@@ -329,8 +356,10 @@ describe("Pomodoro App", () => {
      *
      * We slightly over-advance to ensure we cross the boundary and the next interval tick runs.
      */
+    // Advance time until the phase actually switches (interval tick must run + React commit).
     await advanceTime(61_500);
     await flushTimersAndMicrotasks(user);
+    await advanceUntilChill();
 
     // Phase should have switched to break (CHILL).
     expect(screen.getByRole("heading", { name: /^chill$/i })).toBeInTheDocument();
@@ -411,6 +440,7 @@ describe("Pomodoro App", () => {
 
     await advanceTime(61_500);
     await flushTimersAndMicrotasks(user);
+    await advanceUntilChill();
 
     // Align with the actual completion path: Notification is created at phase end.
     expect(grantedMock).toHaveBeenCalledWith("Work complete", {
@@ -464,12 +494,14 @@ describe("Pomodoro App", () => {
 
     await advanceTime(61_500);
     await flushTimersAndMicrotasks(user);
+    await advanceUntilChill();
 
     // Phase should have switched
     expect(screen.getByRole("heading", { name: /^chill$/i })).toBeInTheDocument();
 
-    // Auto-start schedules startTimer after 100ms; ensure the timeout + first interval tick runs.
-    await advanceTime(300);
+    // Auto-start schedules startTimer after 100ms; then the next phase interval ticks.
+    // We advance past 100ms + one full 250ms tick, and flush commits.
+    await advanceTime(400);
     await flushTimersAndMicrotasks(user);
 
     expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument();

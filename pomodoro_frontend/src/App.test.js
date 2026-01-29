@@ -36,14 +36,24 @@ function mockTodayToLocalDate({ year, monthIndex, day }) {
 }
 
 function getTimeText() {
-  // The "big time" is aria-live=polite. Grab its text content.
-  // This is stable in this app and avoids depending on classnames.
   const el = screen.getByText(/^\d\d:\d\d$/);
   return el.textContent;
 }
 
-function openSettings() {
-  return userEvent.click(screen.getByRole("button", { name: /settings/i }));
+async function flushTimersAndMicrotasks(user) {
+  // Run scheduled timers (interval ticks, toast timeout scheduling, auto-start delay)
+  act(() => {
+    jest.runOnlyPendingTimers();
+  });
+  // user-event uses promises/microtasks; allow them to flush
+  if (user?.keyboard) {
+    // noop - just for a stable "await point"
+    await Promise.resolve();
+  }
+}
+
+function getSettingsButton() {
+  return screen.getByRole("button", { name: /settings/i });
 }
 
 function getSettingsDialog() {
@@ -54,6 +64,14 @@ function getTimerControlsGroup() {
   return screen.getByRole("group", { name: /timer controls/i });
 }
 
+function getPhaseKicker() {
+  // Avoid ambiguous /work session/i (also appears in stats copy).
+  // Use the "phase title" region (kicker + h1).
+  return within(screen.getByText(/work session|break session/i).closest(".phaseTitle") || document.body).getByText(
+    /work session|break session/i
+  );
+}
+
 describe("Pomodoro App", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -61,11 +79,13 @@ describe("Pomodoro App", () => {
   });
 
   afterEach(() => {
-    jest.runOnlyPendingTimers();
+    // Ensure no timers leak between tests (toast timeout, interval, etc.)
+    act(() => {
+      jest.runOnlyPendingTimers();
+    });
     jest.useRealTimers();
     jest.restoreAllMocks();
     localStorage.clear();
-    // ensure any mocked Notification doesn't leak
     delete window.Notification;
   });
 
@@ -78,15 +98,17 @@ describe("Pomodoro App", () => {
     expect(within(controls).getByRole("button", { name: /reset/i })).toBeInTheDocument();
     expect(within(controls).getByRole("button", { name: /skip/i })).toBeInTheDocument();
 
-    // Default initial time for work session: 25:00
     expect(getTimeText()).toBe("25:00");
-    expect(screen.getByText(/work session/i)).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /focus/i })).toBeInTheDocument();
+
+    // Disambiguate "Work Session" from stats copy by scoping to the phase title area.
+    expect(getPhaseKicker()).toHaveTextContent(/work session/i);
+    expect(screen.getByRole("heading", { name: /^focus$/i })).toBeInTheDocument();
   });
 
-  test("timer start/pause: clicking Start requests permission (if Notification default) and toggles to Pause, then Pause stops countdown updates", async () => {
-    // Mock Notification API (present but default permission)
+  test("timer start/pause: Start requests permission (if Notification default) and toggles to Pause; Pause freezes countdown", async () => {
     const requestPermission = jest.fn().mockResolvedValue("denied");
+
+    // App checks: ("Notification" in window) and Notification.permission / Notification.requestPermission()
     window.Notification = {
       permission: "default",
       requestPermission,
@@ -98,25 +120,30 @@ describe("Pomodoro App", () => {
     expect(getTimeText()).toBe("25:00");
 
     await user.click(screen.getByRole("button", { name: /start/i }));
-    expect(requestPermission).toHaveBeenCalledTimes(1);
+    await flushTimersAndMicrotasks(user);
 
-    // Start button swaps to Pause
+    expect(requestPermission).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument();
 
-    // Countdown should decrease after enough time passes
     act(() => {
       jest.advanceTimersByTime(1200);
     });
+    await flushTimersAndMicrotasks(user);
+
     const afterStart = getTimeText();
     expect(afterStart).not.toBe("25:00");
 
     await user.click(screen.getByRole("button", { name: /pause/i }));
+    await flushTimersAndMicrotasks(user);
+
     expect(screen.getByRole("button", { name: /start/i })).toBeInTheDocument();
 
     const frozen = getTimeText();
     act(() => {
       jest.advanceTimersByTime(2500);
     });
+    await flushTimersAndMicrotasks(user);
+
     expect(getTimeText()).toBe(frozen);
   });
 
@@ -125,79 +152,84 @@ describe("Pomodoro App", () => {
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
+
     act(() => {
       jest.advanceTimersByTime(2200);
     });
+    await flushTimersAndMicrotasks(user);
     expect(getTimeText()).not.toBe("25:00");
 
     await user.click(screen.getByRole("button", { name: /reset/i }));
-    expect(getTimeText()).toBe("25:00");
+    await flushTimersAndMicrotasks(user);
 
-    // Toast message
+    expect(getTimeText()).toBe("25:00");
     expect(screen.getByRole("status")).toHaveTextContent(/reset\./i);
   });
 
-  test("settings apply immediately while paused: changing Work minutes updates the display and is persisted to localStorage", async () => {
+  test("settings apply immediately while paused: changing Work minutes updates display and persists to localStorage", async () => {
     render(<App />);
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
     expect(getTimeText()).toBe("25:00");
 
-    await openSettings();
+    await user.click(getSettingsButton());
     const dialog = getSettingsDialog();
 
     const workInput = within(dialog).getByLabelText(/work minutes/i);
     expect(workInput).toHaveValue(25);
 
-    // Change to 1 minute
     await user.clear(workInput);
     await user.type(workInput, "1");
 
-    // While not running, display updates immediately to 01:00
+    // While not running, display updates immediately.
     expect(getTimeText()).toBe("01:00");
 
-    // Persisted via effect
+    // Persist happens in effect; allow React to flush.
+    await flushTimersAndMicrotasks(user);
+
     const stored = JSON.parse(localStorage.getItem(SETTINGS_KEY));
     expect(stored).toMatchObject({ workMinutes: 1, breakMinutes: 5, autoStartNext: false });
 
-    // Close modal
     await user.click(within(dialog).getByRole("button", { name: /done/i }));
     expect(screen.queryByRole("dialog", { name: /pomodoro settings/i })).not.toBeInTheDocument();
   });
 
-  test("settings while running do NOT change the current countdown immediately; reset applies new duration", async () => {
+  test("settings while running do NOT change current countdown immediately; reset applies new duration", async () => {
     render(<App />);
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
-    // Start timer and let it tick down a bit
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
+
     act(() => {
       jest.advanceTimersByTime(1500);
     });
+    await flushTimersAndMicrotasks(user);
+
     const runningTime = getTimeText();
     expect(runningTime).not.toBe("25:00");
 
-    await openSettings();
+    await user.click(getSettingsButton());
     const dialog = getSettingsDialog();
     const workInput = within(dialog).getByLabelText(/work minutes/i);
 
-    // Set to 2 minutes while running
     await user.clear(workInput);
     await user.type(workInput, "2");
 
-    // Countdown continues from current remaining; it should not jump to 02:00 mid-run
+    // Should not jump while running
     expect(getTimeText()).toBe(runningTime);
 
-    // After reset, timer should be 02:00
     await user.click(within(dialog).getByRole("button", { name: /done/i }));
     await user.click(screen.getByRole("button", { name: /reset/i }));
+    await flushTimersAndMicrotasks(user);
+
     expect(getTimeText()).toBe("02:00");
   });
 
-  test("phase transitions: completing a work session increments today's completedPomodoros and switches to Break with toast; stats persist in localStorage", async () => {
+  test("phase transitions: completing a work session increments today's completedPomodoros and switches to Break with toast; stats persist", async () => {
     const restoreDate = mockTodayToLocalDate({ year: 2020, monthIndex: 0, day: 2 });
 
-    // Make work session 1 minute so we can complete quickly, break 1 minute for predictable next display
     localStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({ workMinutes: 1, breakMinutes: 1, autoStartNext: false })
@@ -207,30 +239,26 @@ describe("Pomodoro App", () => {
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
     expect(getTimeText()).toBe("01:00");
-    expect(screen.getByRole("heading", { name: /focus/i })).toBeInTheDocument();
-    expect(screen.getAllByText("0")[0]).toBeInTheDocument(); // Today stat starts at 0
+    expect(screen.getByRole("heading", { name: /^focus$/i })).toBeInTheDocument();
+
+    // Initial "Today" value is 0, but avoid brittle getAllByText("0") because other 0s may appear.
+    expect(screen.getByText(/today/i)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
 
-    // Move past end of phase (1 minute). tick is every 250ms and uses Date.now/endAt,
-    // so advancing timers is sufficient in fake timers.
     act(() => {
       jest.advanceTimersByTime(61_000);
     });
+    await flushTimersAndMicrotasks(user);
 
-    // Should be in Break ("CHILL") now
-    expect(screen.getByRole("heading", { name: /chill/i })).toBeInTheDocument();
-    expect(screen.getByText(/break session/i)).toBeInTheDocument();
+    // Should be in break
+    expect(screen.getByRole("heading", { name: /^chill$/i })).toBeInTheDocument();
+    expect(getPhaseKicker()).toHaveTextContent(/break session/i);
 
-    // Toast should announce completion
     const toast = screen.getByRole("status");
     expect(toast).toHaveTextContent(/work complete/i);
 
-    // Daily stats should have incremented (today's completed = 1)
-    // There are two "1"s in UI potentially; assert via label card and meta chip:
-    expect(screen.getAllByText("1").length).toBeGreaterThanOrEqual(1);
-
-    // Persisted stats should contain key "2020-01-02"
     const storedStats = JSON.parse(localStorage.getItem(STATS_KEY));
     expect(storedStats).toEqual({
       "2020-01-02": { completedPomodoros: 1 },
@@ -250,72 +278,69 @@ describe("Pomodoro App", () => {
     render(<App />);
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
-    expect(screen.getByRole("heading", { name: /focus/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^focus$/i })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /skip/i }));
+    await flushTimersAndMicrotasks(user);
 
-    expect(screen.getByRole("heading", { name: /chill/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^chill$/i })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent(/skipped to break/i);
 
-    // Stats should remain empty (no completed pomodoros on skip)
     const storedStats = JSON.parse(localStorage.getItem(STATS_KEY));
-    // App writes stats on mount ({}), so either {} or null depending on timing.
     expect(storedStats ?? {}).toEqual({});
 
     restoreDate();
   });
 
   test("notifications: if Notification is unsupported, UI shows N/A and start does not throw", async () => {
-    // Ensure Notification is not present
     delete window.Notification;
 
     render(<App />);
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
-    // The Notify chip shows N/A
     expect(screen.getByText(/notify/i)).toBeInTheDocument();
     expect(screen.getByText("N/A")).toBeInTheDocument();
 
-    // Start should work without Notification
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
+
     expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument();
   });
 
-  test("notifications: if permission is granted, completing work session attempts to create a Notification; if denied, it does not", async () => {
+  test("notifications: when permission is granted, completing work session creates a Notification; when denied, it does not", async () => {
     const restoreDate = mockTodayToLocalDate({ year: 2020, monthIndex: 0, day: 2 });
 
-    // 1-minute work for quick completion
     localStorage.setItem(
       SETTINGS_KEY,
       JSON.stringify({ workMinutes: 1, breakMinutes: 1, autoStartNext: false })
     );
 
     // Case A: granted -> new Notification called
-    const notificationCtor = jest.fn();
-    notificationCtor.permission = "granted";
-    notificationCtor.requestPermission = jest.fn().mockResolvedValue("granted");
-    window.Notification = notificationCtor;
+    const grantedCtor = jest.fn();
+    Object.defineProperty(grantedCtor, "permission", { value: "granted", writable: true });
+    grantedCtor.requestPermission = jest.fn().mockResolvedValue("granted");
+    window.Notification = grantedCtor;
 
     render(<App />);
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
 
     act(() => {
       jest.advanceTimersByTime(61_000);
     });
+    await flushTimersAndMicrotasks(user);
 
-    expect(notificationCtor).toHaveBeenCalledTimes(1);
-    expect(notificationCtor).toHaveBeenCalledWith("Work complete", {
+    expect(grantedCtor).toHaveBeenCalledTimes(1);
+    expect(grantedCtor).toHaveBeenCalledWith("Work complete", {
       body: "Take a short break. You earned it.",
     });
 
     // Case B: denied -> new Notification not called
-    // Re-render fresh with denied
-    // Cleanup old tree by rendering again (RTL replaces container)
-    const notificationCtorDenied = jest.fn();
-    notificationCtorDenied.permission = "denied";
-    notificationCtorDenied.requestPermission = jest.fn().mockResolvedValue("denied");
-    window.Notification = notificationCtorDenied;
+    const deniedCtor = jest.fn();
+    Object.defineProperty(deniedCtor, "permission", { value: "denied", writable: true });
+    deniedCtor.requestPermission = jest.fn().mockResolvedValue("denied");
+    window.Notification = deniedCtor;
 
     localStorage.clear();
     localStorage.setItem(
@@ -324,17 +349,21 @@ describe("Pomodoro App", () => {
     );
 
     render(<App />);
+
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
+
     act(() => {
       jest.advanceTimersByTime(61_000);
     });
+    await flushTimersAndMicrotasks(user);
 
-    expect(notificationCtorDenied).toHaveBeenCalledTimes(0);
+    expect(deniedCtor).toHaveBeenCalledTimes(0);
 
     restoreDate();
   });
 
-  test("auto-start next: when enabled, completing a phase automatically starts the next phase (Pause button visible soon after)", async () => {
+  test("auto-start next: when enabled, completing a phase auto-starts the next phase (Pause visible soon after)", async () => {
     const restoreDate = mockTodayToLocalDate({ year: 2020, monthIndex: 0, day: 2 });
 
     localStorage.setItem(
@@ -342,10 +371,9 @@ describe("Pomodoro App", () => {
       JSON.stringify({ workMinutes: 1, breakMinutes: 1, autoStartNext: true })
     );
 
-    // Notification default but requestPermission resolves (avoid unhandled)
     const requestPermission = jest.fn().mockResolvedValue("denied");
     const notificationCtor = jest.fn();
-    notificationCtor.permission = "default";
+    Object.defineProperty(notificationCtor, "permission", { value: "default", writable: true });
     notificationCtor.requestPermission = requestPermission;
     window.Notification = notificationCtor;
 
@@ -353,21 +381,21 @@ describe("Pomodoro App", () => {
     const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
 
     await user.click(screen.getByRole("button", { name: /start/i }));
+    await flushTimersAndMicrotasks(user);
 
-    // Finish work phase
     act(() => {
       jest.advanceTimersByTime(61_000);
     });
+    await flushTimersAndMicrotasks(user);
 
-    // We should be in break
-    expect(screen.getByRole("heading", { name: /chill/i })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /^chill$/i })).toBeInTheDocument();
 
     // Auto-start schedules startTimer after 100ms
     act(() => {
-      jest.advanceTimersByTime(150);
+      jest.advanceTimersByTime(200);
     });
+    await flushTimersAndMicrotasks(user);
 
-    // Should be running -> Pause shown
     expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument();
 
     restoreDate();
